@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>Spring + WebRTC Demo</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    video {
+      width: 45%;
+      border: 1px solid #ccc;
+      background: #000;
+    }
+    #log {
+      margin-top: 12px;
+      font-size: 12px;
+      white-space: pre-wrap;
+      background: #f5f5f5;
+      padding: 8px;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h2>WebRTC Video Chat (Spring Signaling)</h2>
+  <p>두 브라우저(또는 PC + 휴대폰)에서 <code>http://localhost:8080/</code> 에 접속해서 테스트하세요.</p>
+  <div>
+    <video id="localVideo" autoplay playsinline muted></video>
+    <video id="remoteVideo" autoplay playsinline></video>
+  </div>
+  <button id="startBtn">카메라 시작 & 연결</button>
+
+  <div id="log"></div>
+
+  <script>
+    const roomId = "room1"; // 테스트용 고정, 실제로는 URL 파라미터 등으로 분리 가능
+    const ws = new WebSocket("ws://localhost:8080/ws/signal");
+
+    let localStream;
+    let pc; // RTCPeerConnection
+
+    const config = {
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" } // 테스트용 공개 STUN
+      ]
+    };
+
+    const localVideo = document.getElementById("localVideo");
+    const remoteVideo = document.getElementById("remoteVideo");
+    const startBtn = document.getElementById("startBtn");
+    const logBox = document.getElementById("log");
+
+    function log(msg) {
+      console.log(msg);
+      logBox.textContent += msg + "\n";
+    }
+
+    ws.onopen = () => {
+      log("WebSocket connected");
+      // 방 참가
+      ws.send(JSON.stringify({ type: "join", roomId }));
+    };
+
+    ws.onmessage = async (msg) => {
+      const data = JSON.parse(msg.data);
+      log("SIGNAL: " + JSON.stringify(data));
+
+      switch (data.type) {
+        case "joined":
+          // joined 알림 정도는 참고용
+          log(`방 ${data.roomId} 참여 완료. 현재 인원: ${data.clients}`);
+          break;
+
+        case "offer":
+          await createPeerConnection();
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          ws.send(JSON.stringify({
+            type: "answer",
+            roomId,
+            sdp: answer
+          }));
+          log("answer 전송");
+          break;
+
+        case "answer":
+          if (!pc) {
+            log("answer 수신했지만 pc가 없음");
+            return;
+          }
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          log("answer 적용 완료");
+          break;
+
+        case "ice":
+          if (pc) {
+            try {
+              await pc.addIceCandidate(data.candidate);
+              log("ICE candidate 추가");
+            } catch (e) {
+              console.error("Error adding ICE", e);
+              log("ICE 추가 중 에러: " + e);
+            }
+          }
+          break;
+      }
+    };
+
+    ws.onerror = (e) => {
+      console.error("WebSocket error:", e);
+      log("WebSocket error: " + e.message);
+    };
+
+    ws.onclose = () => {
+      log("WebSocket closed");
+    };
+
+    async function createPeerConnection() {
+      if (pc) return;
+
+      pc = new RTCPeerConnection(config);
+
+      // 로컬 스트림이 있을 때만 트랙 추가 (카메라 없는 클라이언트는 수신 전용)
+      if (localStream) {
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      }
+
+      // 원격 트랙 수신
+      pc.ontrack = (event) => {
+        const [stream] = event.streams;
+        log("원격 스트림 수신");
+        remoteVideo.srcObject = stream;
+      };
+
+      // ICE 후보 전송
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          ws.send(JSON.stringify({
+            type: "ice",
+            roomId,
+            candidate: event.candidate
+          }));
+          log("ICE candidate 전송");
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        log("PeerConnection state: " + pc.connectionState);
+      };
+    }
+
+    startBtn.onclick = async () => {
+      // 1) 카메라/마이크 권한 요청 및 로컬 스트림 표시
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true
+        });
+        localVideo.srcObject = localStream;
+        log("로컬 카메라 스트림 확보");
+      } catch (e) {
+        console.warn("getUserMedia 실패 - 이 클라이언트는 수신 전용:", e);
+        log("getUserMedia 실패 (수신 전용으로 동작): " + e.message);
+        localStream = null;
+      }
+
+      // 2) 피어 연결 생성 + offer 전송 (Caller 역할)
+      await createPeerConnection();
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      ws.send(JSON.stringify({
+        type: "offer",
+        roomId,
+        sdp: offer
+      }));
+      log("offer 전송");
+    };
+  </script>
+</body>
+</html>

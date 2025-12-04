@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8" />
+    <title>WebRTC Mesh (N:N) Demo</title>
+    <style>
+        body { font-family: sans-serif; }
+        #videos { display: flex; flex-wrap: wrap; gap: 8px; }
+        video { width: 240px; border: 1px solid #aaa; background: #000; }
+        #chat { margin-top: 20px; }
+        #log { white-space: pre-wrap; font-size: 12px; padding: 8px; background: #eee; height: 150px; overflow-y: auto; }
+        #chatBox { background:#f8f8f8; height:100px; overflow:auto; border:1px solid #ccc; }
+    </style>
+</head>
+
+<body>
+
+<h2>WebRTC Mesh (N:N) Demo</h2>
+<p>?name=alice 같은 방식으로 닉네임을 넘겨주세요.</p>
+
+<div id="videos"></div>
+
+<button id="cameraBtn">카메라 시작</button>
+<button id="connectBtn">WebRTC 연결 시작</button>
+
+<div id="log"></div>
+
+<div id="chat">
+    <h3>채팅</h3>
+    <div id="chatBox"></div>
+    <input id="msg" placeholder="메시지 입력" />
+    <button id="sendMsg">전송</button>
+</div>
+
+<script>
+    const qs = new URLSearchParams(location.search);
+    const myId = qs.get("name") || ("user-" + Math.random().toString(36).slice(2,8));
+    const roomId = "room1";
+
+    const ws = new WebSocket("ws://localhost:8080/ws/signal");
+    let localStream = null;
+
+    // peerId -> { pc, videoEl, pendCandidates: [] }
+    const peerMap = new Map();
+    const rtcConfig = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+    const videos = document.getElementById("videos");
+    const logBox = document.getElementById("log");
+    const chatBox = document.getElementById("chatBox");
+
+    function log(msg) {
+        console.log(msg);
+        logBox.textContent += msg + "\n";
+        logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function appendChat(t) {
+        chatBox.textContent += t + "\n";
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    ws.onopen = () => {
+        log("WebSocket connected");
+        ws.send(JSON.stringify({ type: "join", roomId, name: myId }));
+    };
+
+    ws.onmessage = async (msg) => {
+        const data = JSON.parse(msg.data);
+        const { type } = data;
+
+        switch (type) {
+            case "peers":
+                for (let peer of data.peers) handlePeerJoined(peer);
+                break;
+            case "peer-joined":
+                handlePeerJoined(data.peer);
+                break;
+            case "offer":
+                await handleOffer(data);
+                break;
+            case "answer":
+                await handleAnswer(data);
+                break;
+            case "ice":
+                await handleIce(data);
+                break;
+            case "chat":
+                if (data.from !== myId) appendChat(`${data.from}: ${data.message}`);
+                break;
+            case "peer-left":
+                log(`${data.peer} 퇴장`);
+                break;
+        }
+    };
+
+    // ---- WebRTC 공통 ----
+    async function startCamera() {
+        if (localStream) return;
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+
+        const v = document.createElement("video");
+        v.autoplay = true;
+        v.muted = true;
+        v.playsInline = true;
+        v.srcObject = localStream;
+        videos.appendChild(v);
+
+        log("로컬 카메라 시작");
+    }
+
+    function ensurePeer(peerId) {
+        if (!peerMap.has(peerId)) {
+            peerMap.set(peerId, {
+                pc: null,
+                videoEl: null,
+                pendCandidates: []
+            });
+        }
+        return peerMap.get(peerId);
+    }
+
+    async function ensurePC(peerId) {
+        const info = ensurePeer(peerId);
+        if (info.pc) return info.pc;
+
+        const pc = new RTCPeerConnection(rtcConfig);
+        info.pc = pc;
+
+        if (localStream) {
+            localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+        }
+
+        pc.ontrack = (e) => {
+            const [stream] = e.streams;
+            if (!info.videoEl) {
+                const v = document.createElement("video");
+                v.autoplay = true;
+                v.playsInline = true;
+                info.videoEl = v;
+                videos.appendChild(v);
+            }
+            info.videoEl.srcObject = stream;
+            log(`원격 스트림 수신 from ${peerId}`);
+        };
+
+        pc.onicecandidate = (e) => {
+            if (e.candidate) {
+                ws.send(JSON.stringify({
+                    type: "ice",
+                    roomId,
+                    from: myId,
+                    to: peerId,
+                    candidate: e.candidate
+                }));
+            }
+        };
+
+        pc.onconnectionstatechange = () => {
+            log(`PC(${peerId}) state: ${pc.connectionState}`);
+        };
+
+        return pc;
+    }
+
+    async function flushPendingCandidates(peerId) {
+        const info = ensurePeer(peerId);
+        if (!info.pc || !info.pc.remoteDescription) return;
+
+        while (info.pendCandidates.length > 0) {
+            const c = info.pendCandidates.shift();
+            try {
+                await info.pc.addIceCandidate(c);
+                log(`대기 ICE 후보 적용 for ${peerId}`);
+            } catch (e) {
+                log(`대기 ICE 추가 에러 for ${peerId}: ${e}`);
+            }
+        }
+    }
+
+    // ---- 방 입장/연결 ----
+    function handlePeerJoined(peerId) {
+        if (peerId === myId) return;
+        log(`${peerId} 입장`);
+        ensurePeer(peerId);              // ✅ peerMap 에 꼭 등록해줘야 함
+    }
+
+    async function connectTo(peerId) {
+        if (peerId === myId) return;
+
+        await startCamera();
+        const pc = await ensurePC(peerId);
+
+        // ID가 더 작은 쪽이 offer 생성 → glare 방지
+        if (myId < peerId) {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            ws.send(JSON.stringify({
+                type: "offer",
+                roomId,
+                from: myId,
+                to: peerId,
+                sdp: offer
+            }));
+            log(`offer 전송 to ${peerId}`);
+        } else {
+            log(`나는 ${peerId} 에 대해 answer 역할(offer 기다림)`);
+        }
+    }
+
+    // ---- 시그널 처리 ----
+    async function handleOffer({ from, to, sdp }) {
+        if (to !== myId) return;
+
+        await startCamera();
+        const pc = await ensurePC(from);
+
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        log(`offer remoteDescription 설정 from ${from}`);
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        ws.send(JSON.stringify({
+            type: "answer",
+            roomId,
+            from: myId,
+            to: from,
+            sdp: answer
+        }));
+        log(`answer 전송 to ${from}`);
+
+        await flushPendingCandidates(from);  // ✅ offer 받은 쪽도 pending ICE 처리
+    }
+
+    async function handleAnswer({ from, to, sdp }) {
+        if (to !== myId) return;
+
+        const info = ensurePeer(from);
+        if (!info.pc) return;
+
+        await info.pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        log(`answer remoteDescription 설정 from ${from}`);
+
+        await flushPendingCandidates(from);  // ✅ answer 받은 쪽에도 pending ICE 처리
+    }
+
+    async function handleIce({ from, to, candidate }) {
+        if (to !== myId) return;
+
+        const info = ensurePeer(from);
+
+        if (!info.pc || !info.pc.remoteDescription) {
+            // 아직 PC/remoteDescription 준비 안 됨 → 큐에 저장
+            info.pendCandidates.push(candidate);
+            log(`ICE 후보 큐에 저장 from ${from}`);
+            return;
+        }
+
+        try {
+            await info.pc.addIceCandidate(candidate);
+            log(`ICE 후보 추가 from ${from}`);
+        } catch (e) {
+            log(`ICE 추가 에러 from ${from}: ${e}`);
+        }
+    }
+
+    // ---- 버튼/채팅 ----
+    document.getElementById("cameraBtn").onclick = startCamera;
+
+    document.getElementById("connectBtn").onclick = async () => {
+        // 현재 알고 있는 모든 peer 에 대해 연결 시도
+        for (const [peerId] of peerMap) {
+            await connectTo(peerId);
+        }
+    };
+
+    document.getElementById("sendMsg").onclick = () => {
+        const input = document.getElementById("msg");
+        const text = input.value.trim();
+        if (!text) return;
+        input.value = "";
+
+        ws.send(JSON.stringify({
+            type: "chat",
+            roomId,
+            from: myId,
+            message: text
+        }));
+        appendChat(`(me) ${text}`);
+    };
+</script>
+
+</body>
+</html>
